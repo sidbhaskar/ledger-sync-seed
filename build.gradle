@@ -18,6 +18,11 @@ dependencies {
     // runtime dependency only. Add whatever you need for your document store.
     runtimeOnly 'com.h2database:h2:2.2.224'
 
+    // AWS SDK v2 for DynamoDB (document store, Task 4)
+    implementation platform('software.amazon.awssdk:bom:2.25.60')
+    implementation 'software.amazon.awssdk:dynamodb'
+    implementation 'software.amazon.awssdk:url-connection-client'
+
     testImplementation platform('org.junit:junit-bom:5.10.2')
     testImplementation 'org.junit.jupiter:junit-jupiter'
     testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
