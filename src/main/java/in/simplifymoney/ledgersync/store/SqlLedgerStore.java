@@ -2,6 +2,7 @@ package in.simplifymoney.ledgersync.store;
 
 import in.simplifymoney.ledgersync.model.Category;
 import in.simplifymoney.ledgersync.model.Direction;
+import in.simplifymoney.ledgersync.model.LedgerRow;
 import in.simplifymoney.ledgersync.model.NormalizedTxn;
 import java.math.BigDecimal;
 import java.nio.file.Files;
@@ -36,7 +37,8 @@ public final class SqlLedgerStore implements LedgerStore, AutoCloseable {
         } catch (SQLException e) {
             throw new IllegalStateException(
                     "could not open the ledger database at " + dbFile
-                            + " (is the H2 driver on the runtime classpath?)", e);
+                            + " (is the H2 driver on the runtime classpath?)",
+                    e);
         }
     }
 
@@ -57,12 +59,14 @@ public final class SqlLedgerStore implements LedgerStore, AutoCloseable {
                         "SELECT 1 FROM schema_history WHERE filename = ?")) {
                     q.setString(1, name);
                     try (ResultSet rs = q.executeQuery()) {
-                        if (rs.next()) continue;
+                        if (rs.next())
+                            continue;
                     }
                 }
                 String sql = Files.readString(f);
                 for (String stmt : sql.split(";")) {
-                    if (!stmt.isBlank()) st.execute(stmt);
+                    if (!stmt.isBlank())
+                        st.execute(stmt);
                 }
                 try (PreparedStatement ins = conn.prepareStatement(
                         "INSERT INTO schema_history(filename) VALUES (?)")) {
@@ -78,10 +82,15 @@ public final class SqlLedgerStore implements LedgerStore, AutoCloseable {
 
     @Override
     public void save(NormalizedTxn t) {
+        saveWithBalance(t, null);
+    }
+
+    @Override
+    public void saveWithBalance(NormalizedTxn t, BigDecimal statedBalance) {
         try (PreparedStatement ps = conn.prepareStatement(
                 "INSERT INTO ledger(account_last4, occurred_at, direction, amount,"
-                        + " category, merchant, source_message_ids)"
-                        + " VALUES (?,?,?,?,?,?,?)")) {
+                        + " category, merchant, source_message_ids, stated_balance)"
+                        + " VALUES (?,?,?,?,?,?,?,?)")) {
             ps.setString(1, t.accountLast4());
             ps.setString(2, t.occurredAt().toString());
             ps.setString(3, t.direction().name());
@@ -89,6 +98,11 @@ public final class SqlLedgerStore implements LedgerStore, AutoCloseable {
             ps.setString(5, t.category().name());
             ps.setString(6, t.merchant());
             ps.setString(7, String.join(",", t.sourceMessageIds()));
+            if (statedBalance != null) {
+                ps.setBigDecimal(8, statedBalance);
+            } else {
+                ps.setNull(8, java.sql.Types.DECIMAL);
+            }
             ps.executeUpdate();
         } catch (SQLException e) {
             throw new IllegalStateException("could not save " + t, e);
@@ -97,11 +111,57 @@ public final class SqlLedgerStore implements LedgerStore, AutoCloseable {
 
     @Override
     public List<NormalizedTxn> all() {
+        return queryAll("SELECT account_last4, occurred_at, direction, amount, category,"
+                + " merchant, source_message_ids FROM ledger ORDER BY occurred_at");
+    }
+
+    /**
+     * Returns only transactions produced by fresh corpus ingestion,
+     * excluding the legacy seed rows from V2__seed.sql.
+     */
+    public List<NormalizedTxn> allFresh() {
+        return queryAll("SELECT account_last4, occurred_at, direction, amount, category,"
+                + " merchant, source_message_ids FROM ledger"
+                + " WHERE source_message_ids NOT LIKE '%m-legacy-%'"
+                + " ORDER BY occurred_at");
+    }
+
+    /**
+     * Returns fresh rows (no legacy seed rows) including the bank-stated
+     * balance for reconciliation.
+     */
+    @Override
+    public List<LedgerRow> allRows() {
+        List<LedgerRow> out = new ArrayList<>();
+        try (Statement st = conn.createStatement();
+                ResultSet rs = st.executeQuery(
+                        "SELECT account_last4, occurred_at, direction, amount, category,"
+                        + " merchant, source_message_ids, stated_balance FROM ledger"
+                        + " WHERE source_message_ids NOT LIKE '%m-legacy-%'"
+                        + " ORDER BY occurred_at")) {
+            while (rs.next()) {
+                NormalizedTxn txn = new NormalizedTxn(
+                        rs.getString(1),
+                        OffsetDateTime.parse(rs.getString(2)),
+                        Direction.valueOf(rs.getString(3)),
+                        rs.getBigDecimal(4).setScale(2),
+                        Category.valueOf(rs.getString(5)),
+                        rs.getString(6),
+                        Arrays.stream(rs.getString(7).split(","))
+                                .filter(s -> !s.isBlank()).toList());
+                BigDecimal sb = rs.getBigDecimal(8);
+                out.add(new LedgerRow(txn, sb != null ? sb.setScale(2) : null));
+            }
+        } catch (SQLException e) {
+            throw new IllegalStateException("could not read the ledger", e);
+        }
+        return out;
+    }
+
+    private List<NormalizedTxn> queryAll(String sql) {
         List<NormalizedTxn> out = new ArrayList<>();
         try (Statement st = conn.createStatement();
-             ResultSet rs = st.executeQuery(
-                     "SELECT account_last4, occurred_at, direction, amount, category,"
-                             + " merchant, source_message_ids FROM ledger ORDER BY occurred_at")) {
+                ResultSet rs = st.executeQuery(sql)) {
             while (rs.next()) {
                 out.add(new NormalizedTxn(
                         rs.getString(1),
@@ -122,7 +182,7 @@ public final class SqlLedgerStore implements LedgerStore, AutoCloseable {
     @Override
     public long count() {
         try (Statement st = conn.createStatement();
-             ResultSet rs = st.executeQuery("SELECT COUNT(*) FROM ledger")) {
+                ResultSet rs = st.executeQuery("SELECT COUNT(*) FROM ledger")) {
             return rs.next() ? rs.getLong(1) : 0L;
         } catch (SQLException e) {
             throw new IllegalStateException("could not count the ledger", e);
@@ -131,9 +191,10 @@ public final class SqlLedgerStore implements LedgerStore, AutoCloseable {
 
     public BigDecimal sumAmounts() {
         try (Statement st = conn.createStatement();
-             ResultSet rs = st.executeQuery("SELECT SUM(amount) FROM ledger")) {
+                ResultSet rs = st.executeQuery("SELECT SUM(amount) FROM ledger")) {
             return rs.next() && rs.getBigDecimal(1) != null
-                    ? rs.getBigDecimal(1).setScale(2) : BigDecimal.ZERO.setScale(2);
+                    ? rs.getBigDecimal(1).setScale(2)
+                    : BigDecimal.ZERO.setScale(2);
         } catch (SQLException e) {
             throw new IllegalStateException("could not total the ledger", e);
         }
@@ -141,6 +202,9 @@ public final class SqlLedgerStore implements LedgerStore, AutoCloseable {
 
     @Override
     public void close() {
-        try { conn.close(); } catch (SQLException ignored) { }
+        try {
+            conn.close();
+        } catch (SQLException ignored) {
+        }
     }
 }

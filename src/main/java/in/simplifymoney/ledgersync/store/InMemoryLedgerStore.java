@@ -10,9 +10,18 @@ public final class InMemoryLedgerStore implements LedgerStore {
 
     private final List<NormalizedTxn> rows = new ArrayList<>();
 
-    @Override public void save(NormalizedTxn txn) { rows.add(txn); }
+    @Override
+    public void save(NormalizedTxn txn) {
+        rows.add(txn);
+    }
 
-    @Override public List<NormalizedTxn> all() { return Collections.unmodifiableList(rows); }
+    @Override
+    public List<NormalizedTxn> all() {
+        return Collections.unmodifiableList(rows);
+    }
 
-    @Override public long count() { return rows.size(); }
+    @Override
+    public long count() {
+        return rows.size();
+    }
 }

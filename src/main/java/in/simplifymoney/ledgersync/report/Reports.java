@@ -31,24 +31,37 @@ public final class Reports {
 
             BigDecimal spend = ZERO;
             BigDecimal income = ZERO;
+            int microCount = 0;
+            BigDecimal microTotal = ZERO;
+            BigDecimal transferredOut = ZERO;
+            BigDecimal transferredIn = ZERO;
+
             for (NormalizedTxn t : ledger) {
                 if (!t.accountLast4().equals(acct))
                     continue;
-                if (t.direction() == Direction.DEBIT)
-                    spend = spend.add(t.amount());
-                else
-                    income = income.add(t.amount());
+                switch (t.category()) {
+                    case SPEND -> spend = spend.add(t.amount());
+                    case INCOME -> income = income.add(t.amount());
+                    case MICRO -> {
+                        microCount++;
+                        microTotal = microTotal.add(t.amount());
+                    }
+                    case TRANSFER -> {
+                        if (t.direction() == Direction.DEBIT)
+                            transferredOut = transferredOut.add(t.amount());
+                        else
+                            transferredIn = transferredIn.add(t.amount());
+                    }
+                }
             }
 
             Map<String, Object> a = new LinkedHashMap<>();
             a.put("spend", spend.toPlainString());
             a.put("income", income.toPlainString());
-            // TODO micro spends are still counted inside spend, and are not rolled up
-            a.put("micro_count", 0);
-            a.put("micro_total", ZERO.toPlainString());
-            // TODO transfers are still counted as spend and income
-            a.put("transferred_out", ZERO.toPlainString());
-            a.put("transferred_in", ZERO.toPlainString());
+            a.put("micro_count", microCount);
+            a.put("micro_total", microTotal.toPlainString());
+            a.put("transferred_out", transferredOut.toPlainString());
+            a.put("transferred_in", transferredIn.toPlainString());
             accounts.put(acct, a);
         }
         Map<String, Object> doc = new LinkedHashMap<>();
@@ -73,16 +86,85 @@ public final class Reports {
         return doc;
     }
 
-    // short time fix to run the compelte pipeline
-    public static Map<String, Object> reconciliation(List<NormalizedTxn> ledger) {
+    /**
+     * Reconciliation: for each account, replay transactions in time order and
+     * check that the running balance matches the bank's stated balance wherever
+     * the bank quoted one.
+     *
+     * A discrepancy entry is written whenever the ledger-derived balance diverges
+     * from the bank's stated balance at a given transaction. The stated_balance
+     * is then used as the new running balance anchor to prevent cascading errors.
+     */
+    public static Map<String, Object> reconciliation(List<in.simplifymoney.ledgersync.model.LedgerRow> rows) {
+        // Group rows by account, in time order (they are already ordered)
+        Map<String, List<in.simplifymoney.ledgersync.model.LedgerRow>> byAccount =
+                new java.util.LinkedHashMap<>();
+        for (in.simplifymoney.ledgersync.model.LedgerRow row : rows) {
+            byAccount.computeIfAbsent(row.txn().accountLast4(), k -> new java.util.ArrayList<>())
+                    .add(row);
+        }
+
+        List<Object> discrepancies = new java.util.ArrayList<>();
+
+        for (Map.Entry<String, List<in.simplifymoney.ledgersync.model.LedgerRow>> e : byAccount.entrySet()) {
+            String acct = e.getKey();
+            List<in.simplifymoney.ledgersync.model.LedgerRow> acctRows = e.getValue();
+
+            // Find the first row that has a stated balance — that becomes our anchor.
+            BigDecimal running = null;
+            for (in.simplifymoney.ledgersync.model.LedgerRow row : acctRows) {
+                NormalizedTxn t = row.txn();
+                if (running == null) {
+                    if (row.statedBalance() != null) {
+                        // Work backward: if the first stated balance is after the first txn,
+                        // anchor from the stated balance and reverse-apply the transaction.
+                        running = switch (t.direction()) {
+                            case DEBIT -> row.statedBalance().add(t.amount());
+                            case CREDIT -> row.statedBalance().subtract(t.amount());
+                        };
+                    }
+                    // Apply first txn forward once we have an anchor
+                    if (running != null) {
+                        running = switch (t.direction()) {
+                            case DEBIT -> running.subtract(t.amount());
+                            case CREDIT -> running.add(t.amount());
+                        };
+                    }
+                    continue;
+                }
+                // Apply the transaction to the running balance
+                running = switch (t.direction()) {
+                    case DEBIT -> running.subtract(t.amount());
+                    case CREDIT -> running.add(t.amount());
+                };
+                // If this message quoted a balance, check it
+                if (row.statedBalance() != null) {
+                    BigDecimal diff = running.subtract(row.statedBalance());
+                    if (diff.compareTo(BigDecimal.ZERO) != 0) {
+                        Map<String, Object> d = new java.util.LinkedHashMap<>();
+                        d.put("account_last4", acct);
+                        d.put("occurred_at", t.occurredAt().toString());
+                        d.put("amount", t.amount().toPlainString());
+                        d.put("merchant", t.merchant());
+                        d.put("ledger_balance", running.setScale(2).toPlainString());
+                        d.put("bank_stated_balance", row.statedBalance().toPlainString());
+                        d.put("difference", diff.setScale(2).toPlainString());
+                        d.put("note", "Ledger balance diverges from bank-stated balance by "
+                                + diff.setScale(2).toPlainString());
+                        discrepancies.add(d);
+                        // Anchor to the bank's stated balance to avoid cascading errors
+                        running = row.statedBalance();
+                    }
+                }
+            }
+        }
+
         Map<String, Object> doc = new LinkedHashMap<>();
-        doc.put("discrepancies", List.of());
+        doc.put("discrepancies", discrepancies);
         return doc;
     }
-    // public static Map<String, Object> reconciliation(List<NormalizedTxn> ledger)
-    // {
-    // throw new UnsupportedOperationException("reconciliation is not implemented");
-    // }
+
+
 
     public static Map<Category, BigDecimal> byCategory(List<NormalizedTxn> ledger) {
         Map<Category, BigDecimal> out = new LinkedHashMap<>();

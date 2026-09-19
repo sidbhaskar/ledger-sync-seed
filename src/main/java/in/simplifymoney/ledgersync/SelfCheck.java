@@ -57,7 +57,8 @@ public final class SelfCheck {
             BigDecimal running = opening;
             long n = 0;
             for (NormalizedTxn t : ledger) {
-                if (!t.accountLast4().equals(e.getKey())) continue;
+                if (!t.accountLast4().equals(e.getKey()))
+                    continue;
                 n++;
                 running = switch (t.direction()) {
                     case DEBIT -> running.subtract(t.amount());
